@@ -5590,6 +5590,90 @@ ANALYTICS_DB_READY = False
 ADMIN_SECURITY = HTTPBasic(auto_error=False)
 ADMIN_SESSION_COOKIE = "urban_admin_session"
 
+# ---------------------------------------------------------------------------
+# Whole-site review concurrency gate
+# - One browser review = one queue ticket.
+# - At most two review jobs run at the same time; later requests wait FIFO.
+# - This gate does not change FACT/RULE/GIS logic. It only controls entry to
+#   the existing browser-driven "검토하기" pipeline.
+# ---------------------------------------------------------------------------
+ANALYSIS_QUEUE_MAX_CONCURRENT = 2
+ANALYSIS_QUEUE_STALE_SECONDS = 180
+ANALYSIS_QUEUE_LOCK = threading.Lock()
+ANALYSIS_QUEUE_RUNNING: Dict[str, Dict[str, Any]] = {}
+ANALYSIS_QUEUE_WAITING = deque()
+ANALYSIS_QUEUE_TICKETS: Dict[str, Dict[str, Any]] = {}
+
+
+def _analysis_queue_promote_locked(now: Optional[float] = None) -> None:
+    now = time.monotonic() if now is None else now
+    while len(ANALYSIS_QUEUE_RUNNING) < ANALYSIS_QUEUE_MAX_CONCURRENT and ANALYSIS_QUEUE_WAITING:
+        ticket_id = ANALYSIS_QUEUE_WAITING.popleft()
+        row = ANALYSIS_QUEUE_TICKETS.get(ticket_id)
+        if not row or row.get("state") != "waiting":
+            continue
+        row["state"] = "running"
+        row["started_at_monotonic"] = now
+        row["last_seen_monotonic"] = now
+        ANALYSIS_QUEUE_RUNNING[ticket_id] = row
+
+
+def _analysis_queue_cleanup_locked(now: Optional[float] = None) -> None:
+    now = time.monotonic() if now is None else now
+    stale = []
+    for ticket_id, row in list(ANALYSIS_QUEUE_TICKETS.items()):
+        last_seen = float(row.get("last_seen_monotonic") or row.get("created_at_monotonic") or now)
+        if now - last_seen > ANALYSIS_QUEUE_STALE_SECONDS:
+            stale.append(ticket_id)
+    if stale:
+        stale_set = set(stale)
+        for ticket_id in stale:
+            ANALYSIS_QUEUE_RUNNING.pop(ticket_id, None)
+            ANALYSIS_QUEUE_TICKETS.pop(ticket_id, None)
+        if ANALYSIS_QUEUE_WAITING:
+            kept = [ticket_id for ticket_id in ANALYSIS_QUEUE_WAITING if ticket_id not in stale_set]
+            ANALYSIS_QUEUE_WAITING.clear()
+            ANALYSIS_QUEUE_WAITING.extend(kept)
+    _analysis_queue_promote_locked(now)
+
+
+def _analysis_queue_snapshot_locked(ticket_id: str) -> Dict[str, Any]:
+    row = ANALYSIS_QUEUE_TICKETS.get(ticket_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="분석 대기표가 만료되었거나 존재하지 않습니다.")
+    state = str(row.get("state") or "waiting")
+    position = 0
+    if state == "waiting":
+        try:
+            position = list(ANALYSIS_QUEUE_WAITING).index(ticket_id) + 1
+        except ValueError:
+            position = 0
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "state": state,
+        "max_concurrent": ANALYSIS_QUEUE_MAX_CONCURRENT,
+        "running_count": len(ANALYSIS_QUEUE_RUNNING),
+        "waiting_count": len(ANALYSIS_QUEUE_WAITING),
+        "position": position,
+    }
+
+
+def _analysis_queue_release_locked(ticket_id: str) -> Dict[str, Any]:
+    row = ANALYSIS_QUEUE_TICKETS.pop(ticket_id, None)
+    ANALYSIS_QUEUE_RUNNING.pop(ticket_id, None)
+    if ANALYSIS_QUEUE_WAITING:
+        kept = [tid for tid in ANALYSIS_QUEUE_WAITING if tid != ticket_id]
+        ANALYSIS_QUEUE_WAITING.clear()
+        ANALYSIS_QUEUE_WAITING.extend(kept)
+    _analysis_queue_promote_locked()
+    return {
+        "ok": True,
+        "released": bool(row),
+        "running_count": len(ANALYSIS_QUEUE_RUNNING),
+        "waiting_count": len(ANALYSIS_QUEUE_WAITING),
+        "max_concurrent": ANALYSIS_QUEUE_MAX_CONCURRENT,
+    }
 
 
 def analyze_street_block_batch(
@@ -5731,6 +5815,39 @@ def _ensure_analytics_table() -> None:
                 conn.execute("CREATE INDEX IF NOT EXISTS analytics_events_created_idx ON analytics_events(created_at DESC)")
                 conn.execute("CREATE INDEX IF NOT EXISTS analytics_events_visitor_idx ON analytics_events(visitor_id)")
                 conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analysis_runs (
+                        analysis_id VARCHAR(80) PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ,
+                        visitor_id VARCHAR(80) NOT NULL,
+                        session_id VARCHAR(80),
+                        ip_hash VARCHAR(64),
+                        status VARCHAR(20) NOT NULL DEFAULT 'running',
+                        address_text TEXT,
+                        area_m2 DOUBLE PRECISION,
+                        parcel_count INTEGER,
+                        centroid_lat DOUBLE PRECISION,
+                        centroid_lng DOUBLE PRECISION,
+                        recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        result_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        result_note TEXT,
+                        user_agent_group VARCHAR(40)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_created_idx ON analysis_runs(created_at DESC)")
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_visitor_idx ON analysis_runs(visitor_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_status_idx ON analysis_runs(status)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analysis_parcels (
+                        analysis_id VARCHAR(80) NOT NULL,
+                        pnu VARCHAR(30) NOT NULL,
+                        label TEXT,
+                        ordinal INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (analysis_id, pnu)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_parcels_pnu_idx ON analysis_parcels(pnu)")
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS feedback_reports (
                         id VARCHAR(36) PRIMARY KEY,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -5778,6 +5895,39 @@ def _ensure_analytics_table() -> None:
                 """)
                 conn.execute("CREATE INDEX IF NOT EXISTS analytics_events_created_idx ON analytics_events(created_at DESC)")
                 conn.execute("CREATE INDEX IF NOT EXISTS analytics_events_visitor_idx ON analytics_events(visitor_id)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analysis_runs (
+                        analysis_id TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        visitor_id TEXT NOT NULL,
+                        session_id TEXT,
+                        ip_hash TEXT,
+                        status TEXT NOT NULL DEFAULT 'running',
+                        address_text TEXT,
+                        area_m2 REAL,
+                        parcel_count INTEGER,
+                        centroid_lat REAL,
+                        centroid_lng REAL,
+                        recommendations TEXT NOT NULL DEFAULT '[]',
+                        result_summary TEXT NOT NULL DEFAULT '{}',
+                        result_note TEXT,
+                        user_agent_group TEXT
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_created_idx ON analysis_runs(created_at DESC)")
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_visitor_idx ON analysis_runs(visitor_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_runs_status_idx ON analysis_runs(status)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analysis_parcels (
+                        analysis_id TEXT NOT NULL,
+                        pnu TEXT NOT NULL,
+                        label TEXT,
+                        ordinal INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (analysis_id, pnu)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS analysis_parcels_pnu_idx ON analysis_parcels(pnu)")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS feedback_reports (
                         id TEXT PRIMARY KEY,
@@ -5877,6 +6027,194 @@ def _analytics_rows(limit: int = 500) -> List[Dict[str, Any]]:
         item["recommendations"]=_decode_json_field(item.get("recommendations"), [])
         item["result_summary"]=_decode_json_field(item.get("result_summary"), {})
         out.append(item)
+    return out
+
+
+def _analysis_ip_hash(request: Request) -> Optional[str]:
+    """Return a stable pseudonymous network hash without storing the raw IP."""
+    raw = (request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    if not raw and request.client:
+        raw = str(request.client.host or "").strip()
+    if not raw:
+        return None
+    salt = os.getenv("ANALYTICS_IP_SALT", "").strip() or os.getenv("ADMIN_PASSWORD", "").strip() or "urban-redevelopment-platform"
+    return hashlib.sha256(f"{salt}|{raw}".encode("utf-8")).hexdigest()[:24]
+
+
+def _normalized_analysis_parcels(parcels: Any) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in parcels or []:
+        if isinstance(item, dict):
+            pnu = str(item.get("pnu") or "").strip()[:30]
+            label = str(item.get("label") or "").strip()[:300]
+        else:
+            pnu = str(item or "").strip()[:30]
+            label = ""
+        if not pnu or pnu in seen:
+            continue
+        seen.add(pnu)
+        out.append({"pnu": pnu, "label": label})
+        if len(out) >= 5000:
+            break
+    return out
+
+
+def _replace_analysis_parcels_postgres(conn: Any, analysis_id: str, parcels: List[Dict[str, str]]) -> None:
+    conn.execute("DELETE FROM analysis_parcels WHERE analysis_id=%s", (analysis_id,))
+    for idx, item in enumerate(parcels):
+        conn.execute(
+            "INSERT INTO analysis_parcels (analysis_id,pnu,label,ordinal) VALUES (%s,%s,%s,%s) ON CONFLICT (analysis_id,pnu) DO UPDATE SET label=EXCLUDED.label, ordinal=EXCLUDED.ordinal",
+            (analysis_id, item["pnu"], item.get("label") or None, idx),
+        )
+
+
+def _replace_analysis_parcels_sqlite(conn: sqlite3.Connection, analysis_id: str, parcels: List[Dict[str, str]]) -> None:
+    conn.execute("DELETE FROM analysis_parcels WHERE analysis_id=?", (analysis_id,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO analysis_parcels (analysis_id,pnu,label,ordinal) VALUES (?,?,?,?)",
+        [(analysis_id, item["pnu"], item.get("label") or None, idx) for idx, item in enumerate(parcels)],
+    )
+
+
+def _store_analysis_run_start(data: Dict[str, Any]) -> None:
+    _ensure_analytics_table()
+    parcels = _normalized_analysis_parcels(data.get("parcels"))
+    if _database_url():
+        with psycopg.connect(_database_url()) as conn:
+            conn.execute("""
+                INSERT INTO analysis_runs
+                (analysis_id, visitor_id, session_id, ip_hash, status, address_text, area_m2, parcel_count,
+                 centroid_lat, centroid_lng, recommendations, result_summary, result_note, user_agent_group)
+                VALUES (%s,%s,%s,%s,'running',%s,%s,%s,%s,%s,'[]'::jsonb,'{}'::jsonb,NULL,%s)
+                ON CONFLICT (analysis_id) DO UPDATE SET
+                    visitor_id=EXCLUDED.visitor_id, session_id=EXCLUDED.session_id, ip_hash=EXCLUDED.ip_hash,
+                    status='running', address_text=EXCLUDED.address_text, area_m2=EXCLUDED.area_m2,
+                    parcel_count=EXCLUDED.parcel_count, centroid_lat=EXCLUDED.centroid_lat,
+                    centroid_lng=EXCLUDED.centroid_lng, user_agent_group=EXCLUDED.user_agent_group
+            """, (
+                data["analysis_id"], data["visitor_id"], data.get("session_id"), data.get("ip_hash"),
+                data.get("address_text"), data.get("area_m2"), data.get("parcel_count"),
+                data.get("centroid_lat"), data.get("centroid_lng"), data.get("user_agent_group"),
+            ))
+            _replace_analysis_parcels_postgres(conn, data["analysis_id"], parcels)
+            conn.commit()
+    else:
+        created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        with _sqlite_analytics_connect() as conn:
+            conn.execute("""
+                INSERT INTO analysis_runs
+                (analysis_id,created_at,visitor_id,session_id,ip_hash,status,address_text,area_m2,parcel_count,
+                 centroid_lat,centroid_lng,recommendations,result_summary,result_note,user_agent_group)
+                VALUES (?,?,?,?,?,'running',?,?,?,?,?,'[]','{}',NULL,?)
+                ON CONFLICT(analysis_id) DO UPDATE SET
+                    visitor_id=excluded.visitor_id,session_id=excluded.session_id,ip_hash=excluded.ip_hash,status='running',
+                    address_text=excluded.address_text,area_m2=excluded.area_m2,parcel_count=excluded.parcel_count,
+                    centroid_lat=excluded.centroid_lat,centroid_lng=excluded.centroid_lng,user_agent_group=excluded.user_agent_group
+            """, (
+                data["analysis_id"], created_at, data["visitor_id"], data.get("session_id"), data.get("ip_hash"),
+                data.get("address_text"), data.get("area_m2"), data.get("parcel_count"),
+                data.get("centroid_lat"), data.get("centroid_lng"), data.get("user_agent_group"),
+            ))
+            _replace_analysis_parcels_sqlite(conn, data["analysis_id"], parcels)
+            conn.commit()
+
+
+def _store_analysis_run_finish(data: Dict[str, Any]) -> None:
+    _ensure_analytics_table()
+    parcels = _normalized_analysis_parcels(data.get("parcels"))
+    status = str(data.get("status") or "completed")[:20]
+    if status not in {"completed", "review", "failed"}:
+        status = "review"
+    rec_json = json.dumps(data.get("recommendations") or [], ensure_ascii=False)
+    summary_json = json.dumps(data.get("result_summary") or {}, ensure_ascii=False)
+    if _database_url():
+        with psycopg.connect(_database_url()) as conn:
+            conn.execute("""
+                INSERT INTO analysis_runs
+                (analysis_id, visitor_id, session_id, ip_hash, status, completed_at, address_text, area_m2, parcel_count,
+                 centroid_lat, centroid_lng, recommendations, result_summary, result_note, user_agent_group)
+                VALUES (%s,%s,%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)
+                ON CONFLICT (analysis_id) DO UPDATE SET
+                    completed_at=NOW(), visitor_id=EXCLUDED.visitor_id, session_id=EXCLUDED.session_id,
+                    ip_hash=COALESCE(analysis_runs.ip_hash,EXCLUDED.ip_hash), status=EXCLUDED.status,
+                    address_text=EXCLUDED.address_text, area_m2=EXCLUDED.area_m2, parcel_count=EXCLUDED.parcel_count,
+                    centroid_lat=EXCLUDED.centroid_lat, centroid_lng=EXCLUDED.centroid_lng,
+                    recommendations=EXCLUDED.recommendations, result_summary=EXCLUDED.result_summary,
+                    result_note=EXCLUDED.result_note, user_agent_group=EXCLUDED.user_agent_group
+            """, (
+                data["analysis_id"], data["visitor_id"], data.get("session_id"), data.get("ip_hash"), status,
+                data.get("address_text"), data.get("area_m2"), data.get("parcel_count"),
+                data.get("centroid_lat"), data.get("centroid_lng"), rec_json, summary_json,
+                data.get("result_note"), data.get("user_agent_group"),
+            ))
+            _replace_analysis_parcels_postgres(conn, data["analysis_id"], parcels)
+            conn.commit()
+    else:
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with _sqlite_analytics_connect() as conn:
+            conn.execute("""
+                INSERT INTO analysis_runs
+                (analysis_id,created_at,completed_at,visitor_id,session_id,ip_hash,status,address_text,area_m2,parcel_count,
+                 centroid_lat,centroid_lng,recommendations,result_summary,result_note,user_agent_group)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(analysis_id) DO UPDATE SET
+                    completed_at=excluded.completed_at,visitor_id=excluded.visitor_id,session_id=excluded.session_id,
+                    ip_hash=COALESCE(analysis_runs.ip_hash,excluded.ip_hash),status=excluded.status,address_text=excluded.address_text,
+                    area_m2=excluded.area_m2,parcel_count=excluded.parcel_count,centroid_lat=excluded.centroid_lat,
+                    centroid_lng=excluded.centroid_lng,recommendations=excluded.recommendations,
+                    result_summary=excluded.result_summary,result_note=excluded.result_note,user_agent_group=excluded.user_agent_group
+            """, (
+                data["analysis_id"], now, now, data["visitor_id"], data.get("session_id"), data.get("ip_hash"), status,
+                data.get("address_text"), data.get("area_m2"), data.get("parcel_count"), data.get("centroid_lat"),
+                data.get("centroid_lng"), rec_json, summary_json, data.get("result_note"), data.get("user_agent_group"),
+            ))
+            _replace_analysis_parcels_sqlite(conn, data["analysis_id"], parcels)
+            conn.commit()
+
+
+def _analysis_run_rows(limit: int = 500) -> List[Dict[str, Any]]:
+    _ensure_analytics_table()
+    limit = max(1, min(int(limit or 500), 5000))
+    keys = ["analysis_id","created_at","completed_at","visitor_id","session_id","ip_hash","status","address_text","area_m2","parcel_count","centroid_lat","centroid_lng","recommendations","result_summary","result_note","user_agent_group"]
+    if _database_url():
+        with psycopg.connect(_database_url()) as conn:
+            rows = conn.execute("""
+                SELECT analysis_id,created_at,completed_at,visitor_id,session_id,ip_hash,status,address_text,area_m2,parcel_count,
+                       centroid_lat,centroid_lng,recommendations,result_summary,result_note,user_agent_group
+                FROM analysis_runs ORDER BY created_at DESC LIMIT %s
+            """, (limit,)).fetchall()
+            out = [dict(zip(keys, row)) for row in rows]
+            ids = [x["analysis_id"] for x in out]
+            parcel_rows = conn.execute(
+                "SELECT analysis_id,pnu,label,ordinal FROM analysis_parcels WHERE analysis_id = ANY(%s) ORDER BY analysis_id,ordinal",
+                (ids,),
+            ).fetchall() if ids else []
+    else:
+        with _sqlite_analytics_connect() as conn:
+            rows = conn.execute("""
+                SELECT analysis_id,created_at,completed_at,visitor_id,session_id,ip_hash,status,address_text,area_m2,parcel_count,
+                       centroid_lat,centroid_lng,recommendations,result_summary,result_note,user_agent_group
+                FROM analysis_runs ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+            out = [dict(row) for row in rows]
+            ids = [x["analysis_id"] for x in out]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                parcel_rows = conn.execute(
+                    f"SELECT analysis_id,pnu,label,ordinal FROM analysis_parcels WHERE analysis_id IN ({placeholders}) ORDER BY analysis_id,ordinal",
+                    ids,
+                ).fetchall()
+            else:
+                parcel_rows = []
+    by_id: Dict[str, List[Dict[str, Any]]] = {str(x["analysis_id"]): [] for x in out}
+    for row in parcel_rows:
+        aid, pnu, label, ordinal = row
+        by_id.setdefault(str(aid), []).append({"pnu": str(pnu), "label": str(label or ""), "ordinal": int(ordinal or 0)})
+    for item in out:
+        item["recommendations"] = _decode_json_field(item.get("recommendations"), [])
+        item["result_summary"] = _decode_json_field(item.get("result_summary"), {})
+        item["parcels"] = by_id.get(str(item.get("analysis_id")), [])
     return out
 
 
@@ -7224,6 +7562,223 @@ def _safe_medical_reference(geometry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ============================================================
+# 2009 서울시 준공업지역 종합발전계획 — 가구별 공장비율 벡터 FACT
+# 원천: 사용자가 2009 자치구별 현황도와 서울시 연속지적을 대조·보정한 완료 DXF.
+# 배포본에는 완료 DXF 자체가 아니라, 공장비율 4등급 + 도시계획시설을 dissolve한
+# WGS84 GeoJSON만 포함한다. 브라우저에는 전체 원자료를 보내지 않고 대상지 중첩결과만 반환한다.
+# ============================================================
+FACTORY_RATIO_2009_GEOJSON = _data_path("semiindustrial_factory_ratio_2009.geojson")
+FACTORY_RATIO_2009_CLASSES = {
+    "LT10": {"label": "10% 미만", "min": 0.0, "max": 10.0},
+    "10_30": {"label": "10~30%", "min": 10.0, "max": 30.0},
+    "30_50": {"label": "30~50%", "min": 30.0, "max": 50.0},
+    "GE50": {"label": "50% 이상", "min": 50.0, "max": 100.0},
+}
+
+
+@lru_cache(maxsize=1)
+def _factory_ratio_2009_reference() -> Dict[str, Any]:
+    path = FACTORY_RATIO_2009_GEOJSON
+    if not os.path.isfile(path):
+        return {"available": False, "reason": "2009 공장비율 벡터 GeoJSON 미탑재", "path": path}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            fc = json.load(f)
+        to_metric = Transformer.from_crs(4326, 5186, always_xy=True).transform
+        rows: List[Dict[str, Any]] = []
+        for feature in fc.get("features") or []:
+            props = dict(feature.get("properties") or {})
+            code = str(props.get("factory_class") or "").strip()
+            if code not in {*FACTORY_RATIO_2009_CLASSES.keys(), "FACILITY"}:
+                continue
+            geom = _polygonal_only(shape(feature.get("geometry") or {}))
+            if geom is None or geom.is_empty:
+                continue
+            if not geom.is_valid:
+                geom = _polygonal_only(geom.buffer(0))
+            if geom is None or geom.is_empty:
+                continue
+            metric = _polygonal_only(geometry_transform(to_metric, geom))
+            if metric is None or metric.is_empty:
+                continue
+            rows.append({"code": code, "properties": props, "geometry": geom, "metric": metric})
+        meta = dict(fc.get("properties") or {})
+        return {
+            "available": bool(rows),
+            "rows": rows,
+            "metadata": meta,
+            "path": path,
+            "feature_count": len(rows),
+            "source_file": os.path.basename(path),
+        }
+    except Exception as exc:
+        logger.exception("2009 factory-ratio vector load failed")
+        return {"available": False, "reason": str(exc)[:300], "path": path}
+
+
+def analyze_factory_ratio_2009(geometry: Dict[str, Any]) -> Dict[str, Any]:
+    ref = _factory_ratio_2009_reference()
+    if not ref.get("available"):
+        return {
+            "available": False, "loaded": False, "known": False, "status": "UNAVAILABLE",
+            "reason": ref.get("reason") or "2009 공장비율 벡터 미연결",
+            "class_label": "", "class_breakdown": [], "overlap_pct": None,
+            "threshold_10": {"lt10_status": "REVIEW", "gte10_status": "REVIEW"},
+        }
+    site_wgs = _polygonal_only(shape(geometry))
+    if site_wgs is None or site_wgs.is_empty:
+        raise ValueError("유효한 Polygon 또는 MultiPolygon 구역계가 필요합니다.")
+    if not site_wgs.is_valid:
+        site_wgs = _polygonal_only(site_wgs.buffer(0))
+    if site_wgs is None or site_wgs.is_empty:
+        raise ValueError("유효한 Polygon 또는 MultiPolygon 구역계가 필요합니다.")
+    to_metric = Transformer.from_crs(4326, 5186, always_xy=True).transform
+    site = _polygonal_only(geometry_transform(to_metric, site_wgs))
+    if site is None or site.is_empty or site.area <= 0:
+        raise ValueError("대상지 면적을 계산할 수 없습니다.")
+    site_area = float(site.area)
+
+    ratio_parts: List[Any] = []
+    mapped_parts: List[Any] = []
+    breakdown: List[Dict[str, Any]] = []
+    facility_area = 0.0
+    for row in ref.get("rows") or []:
+        src = row["metric"]
+        if not src.intersects(site):
+            continue
+        inter = _polygonal_only(src.intersection(site))
+        if inter is None or inter.is_empty:
+            continue
+        area = float(inter.area)
+        if area <= 0.05:
+            continue
+        code = row["code"]
+        mapped_parts.append(inter)
+        if code == "FACILITY":
+            facility_area += area
+            continue
+        cls = FACTORY_RATIO_2009_CLASSES.get(code)
+        if not cls:
+            continue
+        ratio_parts.append(inter)
+        breakdown.append({
+            "factory_class": code,
+            "label": cls["label"],
+            "class_label": cls["label"],
+            "area_m2": round(area, 3),
+            "overlap_pct": round(area / site_area * 100.0, 4),
+            "ratio_min": cls["min"],
+            "ratio_max": cls["max"],
+        })
+
+    # Same class is dissolved to one source feature, but keep this aggregation defensive.
+    agg: Dict[str, Dict[str, Any]] = {}
+    for row in breakdown:
+        code = row["factory_class"]
+        if code not in agg:
+            agg[code] = dict(row)
+        else:
+            agg[code]["area_m2"] += row["area_m2"]
+            agg[code]["overlap_pct"] += row["overlap_pct"]
+    breakdown = list(agg.values())
+    class_order = {"LT10": 0, "10_30": 1, "30_50": 2, "GE50": 3}
+    breakdown.sort(key=lambda x: class_order.get(x["factory_class"], 99))
+
+    classified_geom = _polygonal_only(unary_union(ratio_parts)) if ratio_parts else None
+    mapped_geom = _polygonal_only(unary_union(mapped_parts)) if mapped_parts else None
+    classified_area = float(classified_geom.area) if classified_geom is not None and not classified_geom.is_empty else 0.0
+    mapped_area = float(mapped_geom.area) if mapped_geom is not None and not mapped_geom.is_empty else 0.0
+    classified_pct = classified_area / site_area * 100.0
+    mapped_pct = mapped_area / site_area * 100.0
+    facility_pct = facility_area / site_area * 100.0
+    if classified_area > 0:
+        for row in breakdown:
+            row["classified_share_pct"] = round(float(row["area_m2"]) / classified_area * 100.0, 4)
+    else:
+        for row in breakdown:
+            row["classified_share_pct"] = 0.0
+
+    by_code = {r["factory_class"]: float(r["area_m2"]) for r in breakdown}
+    low_area = by_code.get("LT10", 0.0)
+    high10 = by_code.get("10_30", 0.0)
+    high30 = by_code.get("30_50", 0.0)
+    high50 = by_code.get("GE50", 0.0)
+    threshold = {
+        "threshold_pct": 10.0,
+        "lt10_status": "REVIEW",
+        "gte10_status": "REVIEW",
+        "lower_bound_pct": None,
+        "upper_bound_pct": None,
+        "reason": "2009 공장비율 등급 중첩 없음",
+    }
+    if classified_area > 0.05:
+        lower = (high10 * 10.0 + high30 * 30.0 + high50 * 50.0) / classified_area
+        upper = (low_area * 10.0 + high10 * 30.0 + high30 * 50.0 + high50 * 100.0) / classified_area
+        threshold["lower_bound_pct"] = round(lower, 4)
+        threshold["upper_bound_pct"] = round(upper, 4)
+        non_low = high10 + high30 + high50
+        tol = max(0.05, classified_area * 1e-7)
+        if non_low <= tol:
+            # Every classified block is in the report's strict "10% 미만" band.
+            threshold["lt10_status"] = "PASS"
+            threshold["gte10_status"] = "FAIL"
+            threshold["reason"] = "중첩된 공장비율 등급이 전부 10% 미만"
+        elif low_area <= tol:
+            threshold["lt10_status"] = "FAIL"
+            threshold["gte10_status"] = "PASS"
+            threshold["reason"] = "중첩된 공장비율 등급이 전부 10% 이상"
+        elif lower >= 10.0 - 1e-9:
+            # Mixed classes, but even the mathematical lower bound is already 10% or more.
+            threshold["lt10_status"] = "FAIL"
+            threshold["gte10_status"] = "PASS"
+            threshold["reason"] = f"혼합등급 면적가중 하한 {lower:.2f}%로 10% 이상 확정"
+        else:
+            threshold["reason"] = f"10% 미만·이상 등급 혼재 · 면적가중 범위 {lower:.2f}~{upper:.2f}%로 정확한 전체 공장비율 재산정 필요"
+
+    dominant = max(breakdown, key=lambda x: x.get("classified_share_pct", 0.0), default=None)
+    if not breakdown:
+        class_label = "도시계획시설" if facility_area > 0.05 else ""
+        dominant_code = None
+        dominant_share = None
+    elif len(breakdown) == 1 or (dominant and float(dominant.get("classified_share_pct") or 0) >= 99.5):
+        class_label = str(dominant.get("class_label") or "")
+        dominant_code = dominant.get("factory_class")
+        dominant_share = dominant.get("classified_share_pct")
+    else:
+        class_label = "혼합"
+        dominant_code = dominant.get("factory_class") if dominant else None
+        dominant_share = dominant.get("classified_share_pct") if dominant else None
+
+    known = classified_area > 0.05
+    source_meta = ref.get("metadata") or {}
+    return {
+        "available": True,
+        "loaded": True,
+        "known": known,
+        "status": "CONFIRMED" if known else ("FACILITY_ONLY" if facility_area > 0.05 else "OUTSIDE_OR_UNCLASSIFIED"),
+        "site_area_m2": round(site_area, 3),
+        "classified_area_m2": round(classified_area, 3),
+        "mapped_area_m2": round(mapped_area, 3),
+        "facility_area_m2": round(facility_area, 3),
+        "overlap_pct": round(classified_pct, 4),
+        "classified_overlap_pct": round(classified_pct, 4),
+        "mapped_overlap_pct": round(mapped_pct, 4),
+        "facility_overlap_pct": round(facility_pct, 4),
+        "class_label": class_label,
+        "dominant_class": dominant_code,
+        "dominant_share_pct": dominant_share,
+        "class_breakdown": breakdown,
+        "threshold_10": threshold,
+        "reference_date": source_meta.get("reference_date") or "2008-01-31",
+        "source_id": "SEMIINDUSTRIAL_2009_REF",
+        "source_file": ref.get("source_file"),
+        "source_title": source_meta.get("source_title") or "2009 서울시 준공업지역 종합발전계획 수립 용역 최종성과품",
+        "quality": "USER_CORRECTED_CAD_REFERENCE",
+        "note": "2009 계획의 가구별 공장비율 현황도를 서울시 연속지적에 맞춰 보정 완료한 CAD 해치의 공간중첩 결과. 공장비율 10% 경계는 등급으로 확정 가능한 경우 PASS/FAIL에 사용하고, 10% 미만·이상 등급이 혼재해 전체비율이 확정되지 않으면 REVIEW로 남깁니다.",
+    }
+
+
 app = FastAPI(
     title="도시검토 플랫폼 - 서울 재개발 웹 MVP",
     version="2.5.0",
@@ -7623,6 +8178,30 @@ class AnalyticsEventInput(BaseModel):
     result_summary: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AnalysisParcelInput(BaseModel):
+    pnu: str = Field(..., min_length=1, max_length=30)
+    label: Optional[str] = Field(None, max_length=300)
+
+
+class AnalysisRunStartInput(BaseModel):
+    analysis_id: str = Field(..., min_length=8, max_length=80)
+    visitor_id: str = Field(..., min_length=8, max_length=80)
+    session_id: Optional[str] = Field(None, max_length=80)
+    address_text: Optional[str] = Field(None, max_length=1000)
+    parcels: List[AnalysisParcelInput] = Field(default_factory=list, max_length=5000)
+    area_m2: Optional[float] = Field(None, ge=0)
+    parcel_count: Optional[int] = Field(None, ge=0)
+    centroid_lat: Optional[float] = Field(None, ge=-90, le=90)
+    centroid_lng: Optional[float] = Field(None, ge=-180, le=180)
+
+
+class AnalysisRunFinishInput(AnalysisRunStartInput):
+    status: str = Field(..., pattern="^(completed|review|failed)$")
+    recommendations: List[Dict[str, Any]] = Field(default_factory=list, max_length=10)
+    result_summary: Dict[str, Any] = Field(default_factory=dict)
+    result_note: Optional[str] = Field(None, max_length=4000)
+
+
 class AdminVisitorInput(BaseModel):
     visitor_id: Optional[str] = Field(None, min_length=8, max_length=80)
 
@@ -7833,6 +8412,63 @@ def ai_comprehensive_analysis(payload: AIComprehensiveAnalysisInput):
     return _openai_ai_comprehensive(summary)
 
 
+@app.post("/api/analysis-queue/acquire")
+def analysis_queue_acquire():
+    now = time.monotonic()
+    ticket_id = uuid.uuid4().hex
+    with ANALYSIS_QUEUE_LOCK:
+        _analysis_queue_cleanup_locked(now)
+        state = "running" if len(ANALYSIS_QUEUE_RUNNING) < ANALYSIS_QUEUE_MAX_CONCURRENT else "waiting"
+        row = {
+            "ticket_id": ticket_id,
+            "state": state,
+            "created_at_monotonic": now,
+            "last_seen_monotonic": now,
+            "started_at_monotonic": now if state == "running" else None,
+        }
+        ANALYSIS_QUEUE_TICKETS[ticket_id] = row
+        if state == "running":
+            ANALYSIS_QUEUE_RUNNING[ticket_id] = row
+        else:
+            ANALYSIS_QUEUE_WAITING.append(ticket_id)
+        return _analysis_queue_snapshot_locked(ticket_id)
+
+
+@app.get("/api/analysis-queue/status/{ticket_id}")
+def analysis_queue_status(ticket_id: str):
+    with ANALYSIS_QUEUE_LOCK:
+        _analysis_queue_cleanup_locked()
+        row = ANALYSIS_QUEUE_TICKETS.get(ticket_id)
+        if row:
+            row["last_seen_monotonic"] = time.monotonic()
+        return _analysis_queue_snapshot_locked(ticket_id)
+
+
+@app.post("/api/analysis-queue/heartbeat/{ticket_id}")
+def analysis_queue_heartbeat(ticket_id: str):
+    with ANALYSIS_QUEUE_LOCK:
+        _analysis_queue_cleanup_locked()
+        row = ANALYSIS_QUEUE_TICKETS.get(ticket_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="분석 대기표가 만료되었거나 존재하지 않습니다.")
+        row["last_seen_monotonic"] = time.monotonic()
+        return _analysis_queue_snapshot_locked(ticket_id)
+
+
+@app.post("/api/analysis-queue/release/{ticket_id}")
+def analysis_queue_release(ticket_id: str):
+    with ANALYSIS_QUEUE_LOCK:
+        _analysis_queue_cleanup_locked()
+        return _analysis_queue_release_locked(ticket_id)
+
+
+@app.post("/api/analysis-queue/cancel/{ticket_id}")
+def analysis_queue_cancel(ticket_id: str):
+    with ANALYSIS_QUEUE_LOCK:
+        _analysis_queue_cleanup_locked()
+        return _analysis_queue_release_locked(ticket_id)
+
+
 @app.post("/api/analytics/events")
 def analytics_event(payload: AnalyticsEventInput, request: Request):
     if request.cookies.get("urban_admin_exclude") == "1":
@@ -7847,6 +8483,35 @@ def analytics_event(payload: AnalyticsEventInput, request: Request):
         logging.exception("analytics event storage failed")
         return JSONResponse(status_code=202, content={"ok": False, "stored": False})
     return {"ok": True, "stored": True, "storage": _analytics_storage_mode()}
+
+
+@app.post("/api/analytics/analysis-runs/start")
+def analysis_run_start(payload: AnalysisRunStartInput, request: Request):
+    data = payload.model_dump()
+    data["parcels"] = _normalized_analysis_parcels(data.get("parcels"))
+    data["ip_hash"] = _analysis_ip_hash(request)
+    data["user_agent_group"] = _user_agent_group(request)
+    try:
+        _store_analysis_run_start(data)
+    except Exception:
+        logging.exception("analysis run start storage failed")
+        return JSONResponse(status_code=202, content={"ok": False, "stored": False, "storage": _analytics_storage_mode()})
+    return {"ok": True, "stored": True, "analysis_id": data["analysis_id"], "storage": _analytics_storage_mode()}
+
+
+@app.post("/api/analytics/analysis-runs/finish")
+def analysis_run_finish(payload: AnalysisRunFinishInput, request: Request):
+    data = payload.model_dump()
+    data["parcels"] = _normalized_analysis_parcels(data.get("parcels"))
+    data["recommendations"] = data.get("recommendations", [])[:10]
+    data["ip_hash"] = _analysis_ip_hash(request)
+    data["user_agent_group"] = _user_agent_group(request)
+    try:
+        _store_analysis_run_finish(data)
+    except Exception:
+        logging.exception("analysis run finish storage failed")
+        return JSONResponse(status_code=202, content={"ok": False, "stored": False, "storage": _analytics_storage_mode()})
+    return {"ok": True, "stored": True, "analysis_id": data["analysis_id"], "status": data["status"], "storage": _analytics_storage_mode()}
 
 
 @app.post("/api/feedback")
@@ -7916,8 +8581,8 @@ def admin_include_me(request: Request, response: Response, _: bool = Depends(_ad
 def admin_dashboard(request: Request, _: bool = Depends(_admin_auth_or_session)):
     rows = _analytics_rows(5000)
     feedback = _feedback_rows(2000)
-    analyses = [r for r in rows if r.get("event_type") == "analysis_complete"]
-    visitors = {r.get("visitor_id") for r in rows if r.get("visitor_id")}
+    analyses = _analysis_run_rows(5000)
+    visitors = {r.get("visitor_id") for r in rows if r.get("visitor_id")} | {r.get("visitor_id") for r in analyses if r.get("visitor_id")}
     analysis_visitors = {r.get("visitor_id") for r in analyses if r.get("visitor_id")}
     today = datetime.now().astimezone().date()
     def row_date(r):
@@ -7930,25 +8595,41 @@ def admin_dashboard(request: Request, _: bool = Depends(_admin_auth_or_session))
     road_ready = vworld_ready()
     excluded = request.cookies.get("urban_admin_exclude") == "1"
     table_rows = []
-    for r in analyses[:300]:
+    run_status_labels = {"running":"검토 중", "completed":"완료", "review":"완료·확인필요", "failed":"오류종료"}
+    for r in analyses[:500]:
         created = r.get("created_at")
-        if isinstance(created, datetime): created = created.astimezone().strftime("%Y-%m-%d %H:%M")
+        if isinstance(created, datetime):
+            created = created.astimezone().strftime("%Y-%m-%d %H:%M")
+        completed = r.get("completed_at")
+        if isinstance(completed, datetime):
+            completed = completed.astimezone().strftime("%Y-%m-%d %H:%M")
         recs = r.get("recommendations") or []
         if isinstance(recs, str):
             try: recs = json.loads(recs)
             except Exception: recs = []
         rec_text = " / ".join(str(x.get("name") or x.get("scheme") or "") for x in recs[:3] if isinstance(x, dict)) or "추천 없음"
-        pnus = r.get("pnu_list") or []
-        if isinstance(pnus, str):
-            try: pnus = json.loads(pnus)
-            except Exception: pnus = []
+        parcels = r.get("parcels") or []
+        parcel_lines = []
+        for item in parcels:
+            if not isinstance(item, dict):
+                continue
+            pnu = str(item.get("pnu") or "")
+            label = str(item.get("label") or "").strip()
+            parcel_lines.append(f"{html.escape(label) + ' · ' if label else ''}<code>{html.escape(pnu)}</code>")
+        representative = str(r.get("address_text") or "").strip()
+        if not representative and parcels:
+            representative = str((parcels[0] or {}).get("label") or "").strip()
         lat, lng = r.get("centroid_lat"), r.get("centroid_lng")
         map_link = f'<a href="https://map.kakao.com/link/map/{lat},{lng}" target="_blank">지도</a>' if lat is not None and lng is not None else "-"
+        status = str(r.get("status") or "running")
+        status_label = run_status_labels.get(status, status)
+        ip_group = str(r.get("ip_hash") or "")
         table_rows.append(f"""
-          <tr><td>{html.escape(str(created))}</td><td><code>{html.escape(str(r.get('analysis_id') or '-'))}</code></td><td><code>{html.escape(str(r.get('visitor_id',''))[-10:])}</code></td>
-          <td>{html.escape(str(r.get('address_text') or '-'))}</td><td>{float(r.get('area_m2') or 0):,.0f}㎡</td>
-          <td>{int(r.get('parcel_count') or 0)}필지</td><td>{html.escape(rec_text)}</td><td>{map_link}</td>
-          <td><details><summary>{len(pnus)}개 PNU</summary>{'<br>'.join(html.escape(str(x)) for x in pnus)}</details></td></tr>
+          <tr><td>{html.escape(str(created))}</td><td>{html.escape(status_label)}</td><td><code>{html.escape(str(r.get('analysis_id') or '-'))}</code></td>
+          <td><code>{html.escape(str(r.get('visitor_id',''))[-10:])}</code></td><td><code>{html.escape(ip_group[-10:] if ip_group else '-')}</code></td>
+          <td class="wrap">{html.escape(representative or '-')}</td><td>{float(r.get('area_m2') or 0):,.0f}㎡</td>
+          <td>{int(r.get('parcel_count') or len(parcels) or 0)}필지</td><td>{html.escape(rec_text)}</td><td>{map_link}</td>
+          <td><details><summary>{len(parcels)}개 지번/PNU</summary>{'<br>'.join(parcel_lines) or '-'}</details></td></tr>
         """)
     category_labels = {"data":"데이터 오류", "decision":"판정 오류", "screen":"화면 오류", "suggestion":"기능 제안", "other":"기타"}
     status_labels = {"open":"접수", "checking":"확인 중", "done":"처리완료"}
@@ -7981,7 +8662,7 @@ def admin_dashboard(request: Request, _: bool = Depends(_admin_auth_or_session))
     </style><script>function setFeedbackStatus(id,status){{fetch('/admin/feedback/'+encodeURIComponent(id)+'/status',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{status}})}}).then(r=>{{if(!r.ok)throw new Error();}}).catch(()=>alert('처리상태 저장 실패'));}}</script></head><body><header><div><b>도시검토 관리자</b><div style="font-size:11px;opacity:.75">{storage_note}</div></div><a href="/" style="color:white">서비스로</a></header><main>
     <div class="cards"><div class="card"><span>전체 익명 방문자</span><b>{len(visitors):,}</b></div><div class="card"><span>분석 실행 방문자</span><b>{len(analysis_visitors):,}</b></div><div class="card"><span>총 분석 실행</span><b>{len(analyses):,}</b></div><div class="card"><span>오늘 분석</span><b>{today_analyses:,}</b></div><div class="card"><span>미처리 오류·의견</span><b>{open_feedback:,}</b></div><div class="card"><span>도로중심선 API</span><b>{'준비됨' if road_ready else 'VWorld 키 확인'}</b></div></div>
     <div class="tools"><button onclick="fetch('/admin/exclude-me',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{visitor_id:localStorage.getItem('urban_visitor_id_v1')}})}}).then(()=>location.reload())">이 브라우저 앞으로 통계 제외</button><button onclick="fetch('/admin/include-me',{{method:'POST'}}).then(()=>location.reload())">앞으로 통계 다시 포함</button><span class="{'warn' if excluded else ''}">{'현재 관리자 브라우저는 통계에서 제외됩니다.' if excluded else '현재 브라우저도 통계에 포함됩니다.'}</span></div>
-    <h2>최근 대상지 분석</h2><div class="table"><table><thead><tr><th>시각</th><th>분석번호</th><th>익명사용자</th><th>입력주소</th><th>면적</th><th>필지</th><th>추천결과</th><th>위치</th><th>PNU</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan="9">아직 분석 기록이 없습니다.</td></tr>'}</tbody></table></div>
+    <h2>최근 대상지 분석</h2><div class="table"><table><thead><tr><th>시작시각</th><th>상태</th><th>분석번호</th><th>익명사용자</th><th>네트워크그룹</th><th>대표지번·입력주소</th><th>면적</th><th>필지</th><th>추천결과</th><th>위치</th><th>지번/PNU 목록</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan="11">아직 분석 기록이 없습니다.</td></tr>'}</tbody></table></div>
     <h2>오류·개선의견</h2><div class="table"><table><thead><tr><th>접수시각</th><th>분석번호</th><th>유형</th><th>내용</th><th>대상지</th><th>면적</th><th>연락처</th><th>처리상태</th></tr></thead><tbody>{''.join(feedback_rows) or '<tr><td colspan="8">접수된 오류·의견이 없습니다.</td></tr>'}</tbody></table></div>
     </main></body></html>"""
     response = HTMLResponse(content=content)
@@ -8576,6 +9257,31 @@ def heritage_wms_map(
     except Exception as exc:
         logging.warning("heritage WMS proxy failed: %s", exc)
         raise HTTPException(status_code=502, detail="heritage WMS unavailable") from exc
+
+
+@app.get("/api/reference/factory-ratio-2009-status")
+def factory_ratio_2009_status():
+    ref = _factory_ratio_2009_reference()
+    meta = dict(ref.get("metadata") or {})
+    return {
+        "available": bool(ref.get("available")),
+        "feature_count": int(ref.get("feature_count") or 0),
+        "source_file": ref.get("source_file") or "",
+        "reference_date": meta.get("reference_date") or "2008-01-31",
+        "source_title": meta.get("source_title") or "2009 서울시 준공업지역 종합발전계획 수립 용역 최종성과품",
+        "reason": ref.get("reason") or "",
+    }
+
+
+@app.post("/api/spatial/factory-ratio-2009")
+def factory_ratio_2009_intersections(inp: GeometryInput):
+    try:
+        return analyze_factory_ratio_2009(inp.geometry)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logging.exception("2009 factory-ratio intersection failed")
+        raise HTTPException(status_code=500, detail=f"2009 준공업지역 공장비율 분석 오류: {exc}") from exc
 
 
 @app.post("/api/spatial/safe-downtown-exclusion")
