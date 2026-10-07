@@ -43,8 +43,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from pyproj import CRS, Geod, Transformer
 import shapefile
-from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, shape, mapping, box
-from shapely.ops import transform as geometry_transform, unary_union
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, LineString, shape, mapping, box
+from shapely.ops import transform as geometry_transform, unary_union, nearest_points
 from shapely.prepared import prep
 from shapely.strtree import STRtree
 from shapely.validation import explain_validity
@@ -5049,7 +5049,7 @@ def _basic_unit_component(
                 continue
             other = geoms[j]
             try:
-                shared = geom.boundary.intersection(other.boundary)
+                shared = _metric_shared_boundary(geom, other)
                 if shared.is_empty or float(shared.length) < 1.0:
                     continue
             except Exception:
@@ -5108,7 +5108,7 @@ def _ensure_basic_unit_neighbors(
             if topology_stats is not None:
                 topology_stats['shared_calc_count'] = int(topology_stats.get('shared_calc_count', 0)) + 1
             try:
-                shared = geoms[idx].boundary.intersection(geoms[j].boundary)
+                shared = _metric_shared_boundary(geoms[idx], geoms[j])
                 if shared.is_empty or float(shared.length) < 1.0:
                     invalid_edges.add(key)
                     continue
@@ -8862,7 +8862,7 @@ def reference_station_entrances():
 # R22 station-line runtime hotfix.  This block is intentionally backend-only:
 # the existing multi-station frontend already consumes /api/reference/station-lines.
 STATION_RUNTIME_BUILD_MARKER = "R22_STATION_HOTFIX_20260901_0915"
-APP_BUILD_MARKER = "R75_RESTART_CAD_FACILITY_LAYERS_20261006"
+APP_BUILD_MARKER = "R77_RESTART_PLANNING_DRAWING_UI_20261007"
 _STATION_LINE_CACHE_LOCK = threading.Lock()
 _STATION_LINE_CACHE: Dict[str, Any] = {
     "expires_at": 0.0,
@@ -11163,3 +11163,134 @@ def export_cad_context(inp: CadContextInput, request: Request):
     except Exception:
         groups.append({"key": "terrain", "title": "지형", "status": "ERROR", "note": "지형격자 읽기 실패", "features": []})
     return {"groups": groups, "coordinate_system": "EPSG:4326", "scope": "선택 검토범위로 도형 자름"}
+
+
+# R76: centimetre-level contact is a FACT; original geometry is never buffered closed.
+PARCEL_CONTACT_TOLERANCE_M = 0.05
+
+
+def _metric_contact_groups(parts, barriers=None):
+    if len(parts) > 2048:
+        raise HTTPException(status_code=422, detail="도형 구성요소 2,048개를 초과했습니다.")
+    tree = STRtree(parts)
+    parent = list(range(len(parts)))
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    contacts = 0
+    barrier_interior = barriers.buffer(-1e-9) if barriers is not None and not barriers.is_empty else None
+    for i, a in enumerate(parts):
+        for raw in tree.query(a.buffer(PARCEL_CONTACT_TOLERANCE_M + 1e-8), predicate='intersects'):
+            j = int(raw)
+            if j <= i or root(i) == root(j):
+                continue
+            b = parts[j]
+            if a.distance(b) > PARCEL_CONTACT_TOLERANCE_M + 1e-8:
+                continue
+            if barriers is not None and not barriers.is_empty:
+                pa, pb = nearest_points(a, b)
+                bridge = LineString([pa.coords[0], pb.coords[0]]) if pa.distance(pb) > 1e-10 else pa
+                # A real cutter gap is retained even if its width is <=5cm.
+                if barrier_interior.intersects(bridge):
+                    continue
+            parent[root(j)] = root(i)
+            contacts += 1
+    grouped = {}
+    for i in range(len(parts)):
+        grouped.setdefault(root(i), []).append(i)
+    return list(grouped.values()), contacts
+
+
+def _metric_shared_boundary(a, b):
+    """Keep the existing basic-unit 1m shared-edge criterion, allowing <=5cm gaps."""
+    exact = a.boundary.intersection(b.boundary)
+    if not exact.is_empty and float(exact.length) >= 1.0:
+        return exact
+    if a.distance(b) > PARCEL_CONTACT_TOLERANCE_M + 1e-8:
+        return exact
+    # Only a facing segment is used; coordinates/area of either unit remain unchanged.
+    facing = a.boundary.intersection(b.buffer(PARCEL_CONTACT_TOLERANCE_M + 1e-8))
+    return facing if not facing.is_empty and float(facing.length) >= 1.0 else exact
+
+
+def _topology_geometry(geometry):
+    try:
+        if len(json.dumps(geometry, allow_nan=False)) > 3_000_000:
+            raise ValueError()
+        g = shape(geometry)
+        if g.is_empty or g.geom_type not in {"Polygon", "MultiPolygon"} or not g.is_valid:
+            raise ValueError()
+        x0, y0, x1, y1 = g.bounds
+        if not (126.6 <= x0 <= x1 <= 127.4 and 37.2 <= y0 <= y1 <= 37.9):
+            raise ValueError()
+        area, _ = GEOD.geometry_area_perimeter(box(*g.bounds))
+        if abs(float(area)) > 25_000_000:
+            raise ValueError()
+        return g
+    except Exception:
+        raise HTTPException(status_code=422, detail="서울지역의 유효한 Polygon/MultiPolygon, 조회 BOX 25㎢ 이하가 필요합니다.") from None
+
+
+def analyze_boundary_contact(geometry):
+    g = _topology_geometry(geometry)
+    metric = geometry_transform(Transformer.from_crs(4326, 5186, always_xy=True).transform, g)
+    parts = _polygon_parts(metric)
+    groups, contacts = _metric_contact_groups(parts)
+    return {"status": "CONFIRMED", "connected": len(groups) == 1, "component_count": len(groups),
+            "geometry_component_count": len(parts), "contact_tolerance_m": PARCEL_CONTACT_TOLERANCE_M,
+            "geometry_changed": False, "tolerance_contacts": contacts}
+
+
+class BoundaryContactInput(BaseModel):
+    geometry: Dict[str, Any]
+    model_config = {"extra": "forbid"}
+
+
+class BlockContactInput(BoundaryContactInput):
+    blocks: List[Dict[str, Any]] = Field(default_factory=list, max_length=64)
+    cutters: List[Dict[str, Any]] = Field(default_factory=list, max_length=5000)
+    rank_mode: str = Field("share", pattern="^(share|coverage)$")
+
+
+@app.post("/api/spatial/boundary-contact")
+def boundary_contact(inp: BoundaryContactInput):
+    return analyze_boundary_contact(inp.geometry)
+
+
+def refine_block_contact(inp):
+    _topology_geometry(inp.geometry)
+    to_metric = Transformer.from_crs(4326, 5186, always_xy=True).transform
+    to_wgs = Transformer.from_crs(5186, 4326, always_xy=True).transform
+    try:
+        input_size = len(json.dumps({"blocks": inp.blocks, "cutters": inp.cutters}, allow_nan=False))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="유효한 공간 후처리 입력이 필요합니다.") from None
+    if input_size > 10_000_000:
+        raise HTTPException(status_code=422, detail="공간 후처리 입력 크기를 초과했습니다.")
+    cutter_geoms = [geometry_transform(to_metric, _topology_geometry(f["geometry"])) for f in inp.cutters if f.get("geometry")]
+    cutter_tree = STRtree(cutter_geoms)
+    output = []
+    for raw in inp.blocks:
+        if not raw.get("geometry"):
+            continue
+        block = geometry_transform(to_metric, _topology_geometry(raw["geometry"]))
+        local = [cutter_geoms[int(i)] for i in cutter_tree.query(block, predicate='intersects')]
+        barriers = unary_union(local) if local else None
+        refined = block.difference(barriers) if barriers is not None else block
+        parts = [p for p in _polygon_parts(refined) if p.area > 0]
+        groups, _ = _metric_contact_groups(parts, barriers)
+        # Group only pieces of the same raw block. Never merge distinct street blocks.
+        for indexes in groups:
+            combined = unary_union([parts[i] for i in indexes])
+            output.append({"type": "Feature", "geometry": mapping(geometry_transform(to_wgs, combined)),
+                           "properties": {**(raw.get("properties") or {}), "_topology_connected": True, "_topology_geometry_parts": len(indexes),
+                                          "_topology_tolerance_m": PARCEL_CONTACT_TOLERANCE_M}})
+    return {"status": "CONFIRMED", "blocks": output, "contact_tolerance_m": PARCEL_CONTACT_TOLERANCE_M,
+            "original_scope_changed": False}
+
+
+@app.post("/api/spatial/block-contact")
+def block_contact(inp: BlockContactInput):
+    return refine_block_contact(inp)
