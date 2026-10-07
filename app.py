@@ -8862,7 +8862,7 @@ def reference_station_entrances():
 # R22 station-line runtime hotfix.  This block is intentionally backend-only:
 # the existing multi-station frontend already consumes /api/reference/station-lines.
 STATION_RUNTIME_BUILD_MARKER = "R22_STATION_HOTFIX_20260901_0915"
-APP_BUILD_MARKER = "R77_RESTART_PLANNING_DRAWING_UI_20261007"
+APP_BUILD_MARKER = "R82_UI_RESTORE_STATION_2COL_20261007"
 _STATION_LINE_CACHE_LOCK = threading.Lock()
 _STATION_LINE_CACHE: Dict[str, Any] = {
     "expires_at": 0.0,
@@ -11220,8 +11220,18 @@ def _topology_geometry(geometry):
         if len(json.dumps(geometry, allow_nan=False)) > 3_000_000:
             raise ValueError()
         g = shape(geometry)
-        if g.is_empty or g.geom_type not in {"Polygon", "MultiPolygon"} or not g.is_valid:
+        if g.is_empty or g.geom_type not in {"Polygon", "MultiPolygon"}:
             raise ValueError()
+        # Turf's lossless union fallback can contain valid parcels sharing an
+        # edge (or overlapping). The MultiPolygon container is then invalid,
+        # although no individual parcel is invalid. Canonicalize only that
+        # case by exact union; never buffer/snap/repair a malformed parcel.
+        if not g.is_valid:
+            if g.geom_type != "MultiPolygon" or any(p.is_empty or not p.is_valid for p in g.geoms):
+                raise ValueError()
+            g = unary_union(list(g.geoms))
+            if g.is_empty or g.geom_type not in {"Polygon", "MultiPolygon"} or not g.is_valid:
+                raise ValueError()
         x0, y0, x1, y1 = g.bounds
         if not (126.6 <= x0 <= x1 <= 127.4 and 37.2 <= y0 <= y1 <= 37.9):
             raise ValueError()
@@ -11233,14 +11243,247 @@ def _topology_geometry(geometry):
         raise HTTPException(status_code=422, detail="서울지역의 유효한 Polygon/MultiPolygon, 조회 BOX 25㎢ 이하가 필요합니다.") from None
 
 
+def _contact_display_boundary(parts, groups, to_wgs):
+    """VIEW linework only. Never a replacement for the source analysis geometry.
+
+    Within each confirmed contact group, hide the sub-5cm parcel seam in the
+    display outline. Real separated groups and original holes remain visible.
+    The reference is linework, so it cannot be reused as an area denominator.
+    """
+    lines = []
+    reference = None
+    radius = PARCEL_CONTACT_TOLERANCE_M / 2.0 + 1e-8
+    for indexes in groups:
+        originals = [parts[i] for i in indexes]
+        exact = unary_union(originals)
+        display = exact
+        if len(originals) > 1:
+            display = exact.buffer(radius, join_style=2).buffer(-radius, join_style=2)
+            if display.is_empty or not display.is_valid:
+                raise ValueError("contact outline unavailable")
+        display_parts = _polygon_parts(display)
+        if len(groups) == 1 and len(display_parts) == 1:
+            # A sampling reference for building-line extraction, not the
+            # user's business-area geometry or any area-ratio denominator.
+            shell = Polygon(display_parts[0].exterior.coords)
+            reference = {"type": "Feature", "geometry": mapping(geometry_transform(to_wgs, shell)),
+                         "properties": {"reference_only": True}}
+        for p in display_parts:
+            lines.append(LineString(p.exterior.coords))
+            lines.extend(LineString(r.coords) for r in p.interiors)
+        # Closing must never erase a genuine original interior ring, including
+        # narrow holes. Also retain collective holes formed by several parcels.
+        for p in originals:
+            for ring in p.interiors:
+                line = LineString(ring.coords)
+                if not any(line.equals(existing) for existing in lines):
+                    lines.append(line)
+    linework = unary_union(lines)
+    if linework.is_empty or linework.geom_type not in {"LineString", "MultiLineString"}:
+        raise ValueError("contact outline unavailable")
+    geometry = mapping(geometry_transform(to_wgs, linework))
+    if len(json.dumps(geometry, allow_nan=False)) > 3_000_000:
+        raise ValueError("contact outline limit")
+    return {"type": "Feature", "geometry": geometry, "properties": {"display_only": True}}, reference
+
+
 def analyze_boundary_contact(geometry):
     g = _topology_geometry(geometry)
     metric = geometry_transform(Transformer.from_crs(4326, 5186, always_xy=True).transform, g)
     parts = _polygon_parts(metric)
     groups, contacts = _metric_contact_groups(parts)
-    return {"status": "CONFIRMED", "connected": len(groups) == 1, "component_count": len(groups),
+    result = {"status": "CONFIRMED", "connected": len(groups) == 1, "component_count": len(groups),
             "geometry_component_count": len(parts), "contact_tolerance_m": PARCEL_CONTACT_TOLERANCE_M,
             "geometry_changed": False, "tolerance_contacts": contacts}
+    try:
+        outline, reference = _contact_display_boundary(
+            parts, groups, Transformer.from_crs(5186, 4326, always_xy=True).transform)
+        result["display_boundary"] = outline
+        if reference is not None:
+            result["boundary_reference"] = reference
+        result["display_boundary_status"] = "CONFIRMED"
+    except Exception:
+        # A VIEW failure must not change a successfully calculated contact FACT.
+        result["display_boundary_status"] = "UNKNOWN"
+    return result
+
+
+# R80: bounded VIEW data only. None of these arrays feeds an analysis FACT.
+_VIEW_BACKGROUND_CACHE: Dict[str, Dict[str, Any]] = {}
+_VIEW_BACKGROUND_CACHE_LOCK = threading.Lock()
+_VIEW_BACKGROUND_SLOT = threading.BoundedSemaphore(1)
+
+
+class MapBackgroundInput(BaseModel):
+    bounds: List[float] = Field(..., min_length=4, max_length=4)
+    mode: str = Field("detail", pattern="^(detail|roads)$")
+    buildings: bool = False
+    client_origin: Optional[str] = Field(None, max_length=250)
+    model_config = {"extra": "forbid"}
+
+
+def _view_background_scope(bounds, mode):
+    try:
+        x0, y0, x1, y1 = bounds
+        if not all(math.isfinite(v) for v in bounds):
+            raise ValueError()
+        if not (126.6 <= x0 < x1 <= 127.4 and 37.2 <= y0 < y1 <= 37.9):
+            raise ValueError()
+        scope = box(x0, y0, x1, y1)
+        area, _ = GEOD.geometry_area_perimeter(scope)
+        limit = 1_000_000 if mode == "detail" else 25_000_000
+        if not 0 < abs(float(area)) <= limit:
+            raise ValueError()
+        return scope
+    except Exception:
+        raise HTTPException(status_code=422, detail="서울지역 도면 범위가 필요합니다. 근거리 지적은 1㎢, 도로 지적은 25㎢ 이내로 표시합니다.") from None
+
+
+def _view_background_is_road(properties):
+    p = {str(k).lower(): v for k, v in (properties or {}).items()}
+    ledger = p.get("land_ledger") or {}
+    category = str(ledger.get("lndcgrCodeNm") or p.get("lndcgrcodenm") or p.get("jimok") or "").strip()
+    if category:
+        return category in {"도로", "도"}
+    # Official cadastral jibun ends in the land-category abbreviation.
+    return bool(re.search(r"(?:\d|\s)도\s*$", str(p.get("jibun") or "")))
+
+
+def _view_background_features(scope, layer, domain, *, roads_only=False, deadline=None):
+    """Fixed layers, fixed road filter, clipped/sanitized VIEW geometry.
+
+    The official V-world samples document attrfilter column:like:value.
+    A second local check prevents a non-road parcel being drawn as a road.
+    Page limits, timeout or malformed upstream data remain PARTIAL/ERROR.
+    """
+    if layer not in {VWORLD_LAYER_PARCEL, "LT_C_SPBD"}:
+        raise ValueError("Unsupported VIEW layer")
+    if not _vworld_key():
+        return {"status": "ERROR", "features": []}
+    deadline = deadline or time.monotonic() + 22
+    x0, y0, x1, y1 = scope.bounds
+    area, _ = GEOD.geometry_area_perimeter(scope)
+    # VWorld individual BOX queries stay under 10 km2.
+    tiles = [scope] if abs(area) <= 10_000_000 else [
+        box(a, b, c, d) for a, c in ((x0, (x0+x1)/2), ((x0+x1)/2, x1))
+        for b, d in ((y0, (y0+y1)/2), ((y0+y1)/2, y1))
+    ]
+    out, seen, complete, output_bytes = [], set(), True, 0
+    for tile in tiles:
+        minx, miny, maxx, maxy = tile.bounds
+        filtered_query = roads_only
+        for page in range(1, 5):
+            if time.monotonic() >= deadline:
+                return {"status": "PARTIAL", "features": out}
+            params = {"key": _vworld_key(), "domain": domain, "service": "data", "version": "2.0",
+                      "request": "getfeature", "format": "json", "size": 1000, "page": page,
+                      "geometry": "true", "attribute": "true", "crs": "EPSG:4326", "data": layer,
+                      "geomfilter": f"BOX({minx},{miny},{maxx},{maxy})"}
+            if filtered_query:
+                params["attrfilter"] = "jibun:like:도"
+            try:
+                resp, _ = _vworld_get(VWORLD_DATA_URL, params=params, timeout=(2, 5), proxy_timeout=(2, 6), referer_domain=domain)
+                if resp.status_code >= 400:
+                    raise ValueError()
+                payload = resp.json()
+                response = payload.get("response") or {}
+                status = str(response.get("status") or "").upper()
+                if filtered_query and page == 1 and (status == "NOT_FOUND" or status == "OK" and not ((response.get("result") or {}).get("featureCollection") or {}).get("features")):
+                    # An empty suffix filter is not proof that roads are absent.
+                    # Verify the same bounded BOX without the attribute filter,
+                    # still returning only locally classified road parcels.
+                    params.pop("attrfilter", None)
+                    filtered_query = False
+                    resp, _ = _vworld_get(VWORLD_DATA_URL, params=params, timeout=(2, 5), proxy_timeout=(2, 6), referer_domain=domain)
+                    if resp.status_code >= 400:
+                        raise ValueError()
+                    response = resp.json().get("response") or {}
+                    status = str(response.get("status") or "").upper()
+                if status == "NOT_FOUND":
+                    break
+                if status != "OK":
+                    raise ValueError()
+                rows = ((response.get("result") or {}).get("featureCollection") or {}).get("features")
+                if not isinstance(rows, list):
+                    raise ValueError()
+            except Exception:
+                return {"status": "PARTIAL" if out else "ERROR", "features": out}
+            for f in rows:
+                try:
+                    p = f.get("properties") or {}
+                    if roads_only and not _view_background_is_road(p):
+                        continue
+                    raw = f.get("geometry")
+                    if len(json.dumps(raw, allow_nan=False)) > 3_000_000:
+                        raise ValueError()
+                    g = shape(raw)
+                    if g.is_empty or g.geom_type not in {"Polygon", "MultiPolygon"} or not g.is_valid:
+                        raise ValueError()
+                    gx0, gy0, gx1, gy1 = g.bounds
+                    if not (126.6 <= gx0 <= gx1 <= 127.4 and 37.2 <= gy0 <= gy1 <= 37.9):
+                        raise ValueError()
+                    clipped = _polygonal_only(g.intersection(scope))
+                    if clipped is None or clipped.is_empty:
+                        continue
+                    props = {str(k).lower(): v for k, v in p.items()}
+                    fid = str(f.get("id") or props.get("pnu") or props.get("bd_mgt_sn") or hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest())[:160]
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                    clean = {"_view_background": True}
+                    if layer == VWORLD_LAYER_PARCEL:
+                        clean.update(pnu=str(props.get("pnu") or "")[:19], jibun=str(props.get("jibun") or "")[:80], _view_road=_view_background_is_road(p))
+                    feature = {"type": "Feature", "id": fid, "geometry": mapping(clipped), "properties": clean}
+                    output_bytes += len(json.dumps(feature, ensure_ascii=False))
+                    if len(out) >= 5000 or output_bytes > 3_000_000:
+                        return {"status": "PARTIAL", "features": out}
+                    out.append(feature)
+                except Exception:
+                    complete = False
+            if len(rows) < 1000:
+                break
+        else:
+            complete = False
+    return {"status": "COMPLETE" if complete else "PARTIAL", "features": out}
+
+
+@app.post("/api/view/map-background")
+def map_background(inp: MapBackgroundInput, request: Request):
+    scope = _view_background_scope(inp.bounds, inp.mode)
+    if inp.mode == "roads" and inp.buildings:
+        raise HTTPException(status_code=422, detail="광역 도면에는 도로 지적만 조회합니다.")
+    domain = _validated_planning_client_origin(inp.client_origin, request)
+    cache_key = hashlib.sha256(json.dumps([inp.bounds, inp.mode, inp.buildings, domain], allow_nan=False).encode()).hexdigest()
+    with _VIEW_BACKGROUND_CACHE_LOCK:
+        row = _VIEW_BACKGROUND_CACHE.get(cache_key)
+        if row and time.time() - row["saved_at"] < 600:
+            return json.loads(json.dumps(row["result"]))
+    if not _VIEW_BACKGROUND_SLOT.acquire(timeout=1):
+        raise HTTPException(status_code=503, detail="도면 배경 조회 대기 중입니다. 잠시 후 다시 표시합니다.")
+    try:
+        # Check again after waiting: concurrent equal requests share completed data.
+        with _VIEW_BACKGROUND_CACHE_LOCK:
+            row = _VIEW_BACKGROUND_CACHE.get(cache_key)
+            if row and time.time() - row["saved_at"] < 600:
+                return json.loads(json.dumps(row["result"]))
+        parcels = _view_background_features(scope, VWORLD_LAYER_PARCEL, domain, roads_only=inp.mode == "roads")
+        buildings = _view_background_features(scope, "LT_C_SPBD", domain) if inp.buildings else {"status": "NOT_REQUESTED", "features": []}
+        result = {"view_only": True, "bounds": inp.bounds, "mode": inp.mode,
+                  "parcels": {"type": "FeatureCollection", "features": parcels["features"]},
+                  "buildings": {"type": "FeatureCollection", "features": buildings["features"]},
+                  "parcel_status": parcels["status"], "building_status": buildings["status"],
+                  "source": "연속지적 · 건물 공간도형", "note": "도면 배경 전용 · 사업판정 및 대상지 면적에 미반영"}
+        # Successful caches only; bounded count and aggregate bytes.
+        if parcels["status"] == "COMPLETE" and buildings["status"] in {"COMPLETE", "NOT_REQUESTED"}:
+            size = len(json.dumps(result, ensure_ascii=False))
+            with _VIEW_BACKGROUND_CACHE_LOCK:
+                _VIEW_BACKGROUND_CACHE[cache_key] = {"saved_at": time.time(), "size": size, "result": result}
+                while len(_VIEW_BACKGROUND_CACHE) > 64 or sum(r["size"] for r in _VIEW_BACKGROUND_CACHE.values()) > 16_000_000:
+                    oldest = min(_VIEW_BACKGROUND_CACHE, key=lambda k: _VIEW_BACKGROUND_CACHE[k]["saved_at"])
+                    _VIEW_BACKGROUND_CACHE.pop(oldest)
+        return result
+    finally:
+        _VIEW_BACKGROUND_SLOT.release()
 
 
 class BoundaryContactInput(BaseModel):
